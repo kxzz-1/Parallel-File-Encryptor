@@ -1,0 +1,8 @@
+encrypter
+*.o
+*.enc
+*.dec
+*.bin
+test.txt
+test_aes
+bigtest*

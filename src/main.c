@@ -1,0 +1,261 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <mpi.h>
+#include <omp.h>
+#include "file_io.h"
+#include "strategy.h"
+#include "serial_aes.h"
+#include "mpi_handler.h"
+#include "omp_scheduler.h"
+#include "opencl_aes.h"
+#include "benchmark.h"
+
+#define KEY_SIZE 32
+
+// prints usage instructions
+void print_usage(const char *prog) {
+    printf("\n");
+    printf("  Parallel File Encrypter/Decrypter\n");
+    printf("  MPI + OpenMP + OpenCL | AES-CTR\n");
+    printf("\n");
+    printf("  Usage:\n");
+    printf("  mpirun -np 4 %s -e <file> -k <keyfile>\n", prog);
+    printf("  mpirun -np 4 %s -d <file.enc> -k <keyfile>\n", prog);
+    printf("  mpirun -np 4 %s -e <file> -k <keyfile> --bench\n", prog);
+    printf("\n");
+    printf("  Flags:\n");
+    printf("  -e        encrypt\n");
+    printf("  -d        decrypt\n");
+    printf("  -k        key file (32 bytes)\n");
+    printf("  --bench   benchmark serial vs parallel\n");
+    printf("  --serial  force serial mode\n");
+    printf("  --cpu     force MPI + OpenMP mode\n");
+    printf("  --gpu     force MPI + OpenCL mode\n");
+    printf("\n");
+}
+
+// loads 32 byte key from a file
+int load_key(const char *path, uint8_t *key) {
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        // if no key file, use a default test key
+        fprintf(stderr, "[WARN] Key file not found."
+                        " Using default test key.\n");
+        memcpy(key, "01234567890123456789012345678901", KEY_SIZE);
+        return 0;
+    }
+    (void)fread(key, 1, KEY_SIZE, f);
+    fclose(f);
+    printf("[INFO] Key loaded from: %s\n", path);
+    return 0;
+}
+
+// builds output filename
+// encrypt: file.pdf      → file.pdf.enc
+// decrypt: file.pdf.enc  → file.pdf.dec
+void build_output_name(const char *input, char *output,
+                       int encrypting) {
+    if (encrypting) {
+        sprintf(output, "%s.enc", input);
+    } else {
+        // strip .enc and add .dec
+        strcpy(output, input);
+        char *ext = strstr(output, ".enc");
+        if (ext) strcpy(ext, ".dec");
+        else     strcat(output, ".dec");
+    }
+}
+
+int main(int argc, char *argv[]) {
+
+    // ── Init MPI ────────────────────────────
+    MPI_Init(&argc, &argv);
+
+    int rank, nprocs;
+    MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+    MPI_Comm_size(MPI_COMM_WORLD, &nprocs);
+
+    // ── Parse arguments ─────────────────────
+    char    *input_file  = NULL;
+    char    *key_file    = NULL;
+    int      encrypting  = 1;    // 1=encrypt, 0=decrypt
+    int      bench_mode  = 0;
+    int      force_mode  = -1;   // -1=auto, 0=serial, 1=cpu, 2=gpu
+
+    for (int i = 1; i < argc; i++) {
+        if      (!strcmp(argv[i], "-e"))       { encrypting = 1; input_file = argv[++i]; }
+        else if (!strcmp(argv[i], "-d"))       { encrypting = 0; input_file = argv[++i]; }
+        else if (!strcmp(argv[i], "-k"))       { key_file = argv[++i]; }
+        else if (!strcmp(argv[i], "--bench"))  { bench_mode  = 1; }
+        else if (!strcmp(argv[i], "--serial")) { force_mode  = 0; }
+        else if (!strcmp(argv[i], "--cpu"))    { force_mode  = 1; }
+        else if (!strcmp(argv[i], "--gpu"))    { force_mode  = 2; }
+    }
+
+    if (!input_file && rank == 0) {
+        print_usage(argv[0]);
+        MPI_Finalize();
+        return 1;
+    }
+
+    // ── Load key ────────────────────────────
+    uint8_t key[KEY_SIZE];
+    load_key(key_file, key);
+
+    // ── Detect hardware ─────────────────────
+    uint64_t gpu_mem     = 0;
+    int      gpu_available = detect_gpu(&gpu_mem);
+    int      cpu_cores   = omp_get_max_threads();
+
+    // ── Read file and decide strategy ───────
+    FileBuffer file = {NULL, 0};
+    if (rank == 0) {
+        if (encrypting) {
+            file = read_file(input_file);
+        } else {
+            // for decryption read only data after header
+            uint64_t enc_size = 0;
+            uint8_t *enc_data = read_encrypted_data(input_file,
+                                                    &enc_size);
+            file.data = enc_data;
+            file.size = enc_size;
+        }
+    }
+
+    // broadcast file size to all processes
+    MPI_Bcast(&file.size, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+
+    // decide strategy based on runtime info
+    Strategy s = decide_strategy(file.size, nprocs,
+                                 cpu_cores, gpu_available,
+                                 gpu_mem);
+
+    // override strategy if user forced a mode
+    if (force_mode == 0) s.mode = MODE_SERIAL;
+    if (force_mode == 1) s.mode = MODE_MPI_OPENMP;
+    if (force_mode == 2) s.mode = MODE_MPI_OPENCL;
+
+    // print what we decided
+    if (rank == 0) print_strategy(&s);
+
+    // ── Benchmark mode ──────────────────────
+    if (bench_mode) {
+        if (rank == 0) printf("[BENCH] Starting benchmark...\n");
+        BenchmarkResult r = benchmark_run(input_file, key, &s);
+        if (rank == 0) benchmark_print(&r);
+        free_buffer(&file);
+        MPI_Finalize();
+        return 0;
+    }
+
+    // ── Build output filename ───────────────
+    char output_file[512];
+    build_output_name(input_file, output_file, encrypting);
+
+    // ── Get nonce ───────────────────────────
+    uint8_t nonce[16] = {0};
+
+    if (encrypting) {
+        // generate fresh nonce for encryption
+        if (rank == 0) generate_nonce(nonce);
+        // broadcast nonce so all processes use same one
+        MPI_Bcast(nonce, 16, MPI_BYTE, 0, MPI_COMM_WORLD);
+    } else {
+        // read nonce from encrypted file header
+        if (rank == 0) {
+            FileHeader h = read_header(input_file);
+            memcpy(nonce, h.nonce, 16);
+        }
+        MPI_Bcast(nonce, 16, MPI_BYTE, 0, MPI_COMM_WORLD);
+    }
+
+    // ── Run encryption/decryption ────────────
+    uint8_t  *final_output = NULL;
+    uint64_t  final_size   = 0;
+
+    if (s.mode == MODE_SERIAL) {
+        // serial — only master runs
+        if (rank == 0) {
+            final_output = (uint8_t *)malloc(file.size);
+            aes_ctr_encrypt(file.data, final_output,
+                            file.size, key, nonce, 0);
+            final_size = file.size;
+            printf("[OK] Serial encryption done\n");
+        }
+
+    } else if (s.mode == MODE_MPI_OPENMP) {
+        // distribute chunks
+        Chunk chunk;
+        mpi_scatter_file(&file, &chunk, &s, rank, nprocs);
+
+        // encrypt chunk with OpenMP threads
+        uint8_t *chunk_out = (uint8_t *)malloc(chunk.size);
+        omp_encrypt_chunk(&chunk, chunk_out, key, nonce, &s);
+
+        // swap encrypted data back into chunk
+        memcpy(chunk.data, chunk_out, chunk.size);
+        free(chunk_out);
+
+        // gather results to master
+        mpi_gather_results(&chunk, &final_output,
+                           &final_size, &s, rank, nprocs);
+        free_chunk(&chunk);
+
+    } else if (s.mode == MODE_MPI_OPENCL) {
+        // init GPU
+        OpenCLContext ctx;
+        int ok = opencl_init(&ctx);
+
+        if (ok != 0) {
+            // GPU init failed — fallback to OpenMP
+            if (rank == 0)
+                printf("[WARN] GPU init failed, "
+                       "falling back to OpenMP\n");
+            s.mode = MODE_MPI_OPENMP;
+        }
+
+        Chunk chunk;
+        mpi_scatter_file(&file, &chunk, &s, rank, nprocs);
+
+        uint8_t *chunk_out = (uint8_t *)malloc(chunk.size);
+
+        if (ctx.ready)
+            opencl_encrypt_chunk(&ctx, &chunk, chunk_out,
+                                 key, nonce, &s);
+        else
+            omp_encrypt_chunk(&chunk, chunk_out, key, nonce, &s);
+
+        memcpy(chunk.data, chunk_out, chunk.size);
+        free(chunk_out);
+
+        mpi_gather_results(&chunk, &final_output,
+                           &final_size, &s, rank, nprocs);
+
+        free_chunk(&chunk);
+        opencl_cleanup(&ctx);
+    }
+
+    // ── Write output file (master only) ─────
+    if (rank == 0 && final_output) {
+        if (encrypting) {
+            FileHeader header;
+            memcpy(header.magic, MAGIC, MAGIC_SIZE);
+            memcpy(header.nonce, nonce, NONCE_SIZE);
+            header.original_size = file.size;
+            write_encrypted_file(output_file, &header,
+                                 final_output, final_size);
+        } else {
+            // trim to original size on decrypt
+            FileHeader h = read_header(input_file);
+            write_decrypted_file(output_file,
+                                 final_output,
+                                 h.original_size);
+        }
+        free(final_output);
+    }
+
+    free_buffer(&file);
+    MPI_Finalize();
+    return 0;
+}
