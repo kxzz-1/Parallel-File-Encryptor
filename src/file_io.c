@@ -28,7 +28,15 @@ FileBuffer read_file(const char *path) {
         return buf;
     }
 
-    (void)fread(buf.data, 1, buf.size, f);
+    size_t read_bytes = fread(buf.data, 1, buf.size, f);
+    if (read_bytes != buf.size) {
+        fprintf(stderr, "[ERROR] Could not read entire file: %s\\n", path);
+        free(buf.data);
+        buf.data = NULL;
+        fclose(f);
+        buf.size = 0;
+        return buf;
+    }
     fclose(f);
 
     printf("[INFO] Read: %s (%llu bytes)\n", path,
@@ -41,7 +49,9 @@ FileBuffer read_file(const char *path) {
 void generate_nonce(uint8_t *nonce) {
     FILE *rng = fopen("/dev/urandom", "rb");
     if (rng) {
-        (void)fread(nonce, 1, NONCE_SIZE, rng);
+        if (fread(nonce, 1, NONCE_SIZE, rng) != NONCE_SIZE) {
+            fprintf(stderr, "[WARNING] Failed to read enough random bytes from /dev/urandom\\n");
+        }
         fclose(rng);
     } else {
         // fallback if /dev/urandom unavailable
@@ -80,9 +90,14 @@ FileHeader read_header(const char *path) {
         return header;
     }
 
-    (void)fread(header.magic,          1, MAGIC_SIZE,       f);
-    (void)fread(header.nonce,          1, NONCE_SIZE,       f);
-    (void)fread(&header.original_size, 1, sizeof(uint64_t), f);
+    if (fread(header.magic,          1, MAGIC_SIZE,       f) != MAGIC_SIZE ||
+        fread(header.nonce,          1, NONCE_SIZE,       f) != NONCE_SIZE ||
+        fread(&header.original_size, 1, sizeof(uint64_t), f) != sizeof(uint64_t)) {
+        fprintf(stderr, "[ERROR] Failed to read complete header from: %s\\n", path);
+        fclose(f);
+        memset(&header, 0, sizeof(header));
+        return header;
+    }
     fclose(f);
 
     // verify this is actually our encrypted file
@@ -107,7 +122,12 @@ uint8_t *read_encrypted_data(const char *path, uint64_t *out_size) {
     uint8_t *data = (uint8_t *)malloc(*out_size);
     if (!data) { fclose(f); return NULL; }
 
-    (void)fread(data, 1, *out_size, f);
+    if (fread(data, 1, *out_size, f) != *out_size) {
+        fprintf(stderr, "[ERROR] Could not read encrypted data from: %s\\n", path);
+        free(data);
+        fclose(f);
+        return NULL;
+    }
     fclose(f);
     return data;
 }

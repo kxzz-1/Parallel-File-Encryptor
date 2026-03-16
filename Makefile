@@ -1,6 +1,10 @@
-CC      = mpicc
-CFLAGS  = -Wall -O2 -Iinclude -fopenmp
-LDFLAGS = -fopenmp -lOpenCL
+CC         = mpicc
+CFLAGS     = -Wall -O2 -Iinclude -fopenmp
+LDFLAGS    = -fopenmp -lOpenCL
+
+GUI_SRC    = src/gtk_gui.c
+GUI_TARGET = encrypter_gui
+GTK_FLAGS  = $(shell pkg-config --cflags --libs gtk+-3.0)
 
 SRCS = src/main.c \
        src/file_io.c \
@@ -13,10 +17,13 @@ SRCS = src/main.c \
 
 TARGET = encrypter
 
-all: $(TARGET)
+all: $(TARGET) $(GUI_TARGET)
 
 $(TARGET): $(SRCS)
 	$(CC) $(CFLAGS) $(SRCS) -o $(TARGET) $(LDFLAGS)
 
+$(GUI_TARGET): $(GUI_SRC)
+	gcc -Wall -O2 $(GUI_SRC) -o $(GUI_TARGET) $(GTK_FLAGS) -lm
+
 clean:
-	rm -f $(TARGET) *.o *.enc *.dec test_aes
+	rm -f $(TARGET) $(GUI_TARGET) *.o *.enc *.dec test_aes bigtest*

@@ -17,7 +17,17 @@ static char *load_kernel_source(const char *path) {
     fseek(f, 0, SEEK_SET);
 
     char *src = (char *)malloc(size + 1);
-    (void)fread(src, 1, size, f);
+    if (!src) {
+        fclose(f);
+        return NULL;
+    }
+    size_t read_bytes = fread(src, 1, size, f);
+    if (read_bytes != (size_t)size) {
+        fprintf(stderr, "[ERROR] Could not read entire kernel: %s\\n", path);
+        free(src);
+        fclose(f);
+        return NULL;
+    }
     src[size] = '\0';
     fclose(f);
     return src;
