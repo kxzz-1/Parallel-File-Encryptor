@@ -50,6 +50,7 @@ typedef struct {
     GtkWidget *gpu_speedup_lbl;
     GtkWidget *graph_area;
     GtkWidget *output_path_lbl;
+    GtkWidget *copy_path_btn;
     GtkWidget *status_lbl;
     double  serial_time;
     double  cpu_time;
@@ -357,6 +358,10 @@ static void on_browse(GtkButton *b, App *a) {
             "<span foreground='#ffffff' size='small'>Output → </span>"
             "<span foreground='#00d4ff' font_family='monospace' size='small'>%s</span>", out);
         gtk_label_set_markup(GTK_LABEL(a->output_path_lbl), m);
+        if (a->copy_path_btn) {
+            g_object_set_data_full(G_OBJECT(a->copy_path_btn), "path", g_strdup(out), g_free);
+            gtk_widget_set_sensitive(a->copy_path_btn, TRUE);
+        }
         g_free(m);
         g_free(fn);
     }
@@ -405,6 +410,14 @@ static void reset_ui(App *a) {
     }
     for (int i = 0; i < 32; i++)
         a->thread_state[i] = 0, a->thread_last_active[i] = 0;
+
+    g_strlcpy(a->last_output_path, "", sizeof(a->last_output_path));
+    gtk_label_set_markup(GTK_LABEL(a->output_path_lbl),
+        "<span foreground='#475569' size='small'>Output → select a file first</span>");
+    if (a->copy_path_btn) {
+        g_object_set_data_full(G_OBJECT(a->copy_path_btn), "path", g_strdup(""), g_free);
+        gtk_widget_set_sensitive(a->copy_path_btn, FALSE);
+    }
 
     a->serial_time = 0; a->cpu_time = 0; a->gpu_time = 0;
     gtk_label_set_text(GTK_LABEL(a->serial_time_lbl),    "--");
@@ -604,8 +617,13 @@ static void parse_line(const char *line, App *a) {
             while (len>0 && (path[len-1]=='\n'||path[len-1]==' '||
                              path[len-1]=='\r'||path[len-1]=='\t'))
                 path[--len]='\0';
-            if (len > 2)
+            if (len > 2) {
                 g_strlcpy(a->last_output_path, path, sizeof(a->last_output_path));
+                if (a->copy_path_btn) {
+                    g_object_set_data_full(G_OBJECT(a->copy_path_btn), "path", g_strdup(path), g_free);
+                    gtk_widget_set_sensitive(a->copy_path_btn, TRUE);
+                }
+            }
         }
     }
 
@@ -1280,6 +1298,7 @@ static GtkWidget *build_left(App *a) {
     gtk_box_pack_start(GTK_BOX(frow), browse, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), frow, FALSE, FALSE, 0);
 
+    GtkWidget *opath_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     GtkWidget *opath_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
     a->output_path_lbl = gtk_label_new(NULL);
     gtk_label_set_markup(GTK_LABEL(a->output_path_lbl),
@@ -1289,14 +1308,17 @@ static GtkWidget *build_left(App *a) {
     gtk_label_set_line_wrap_mode(GTK_LABEL(a->output_path_lbl), PANGO_WRAP_CHAR);
     gtk_widget_set_hexpand(a->output_path_lbl, TRUE);
     gtk_box_pack_start(GTK_BOX(opath_row), a->output_path_lbl, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(opath_box), opath_row, FALSE, FALSE, 0);
 
-    GtkWidget *copy_main_btn = gtk_button_new_with_label("Copy Path");
-    g_object_set_data_full(G_OBJECT(copy_main_btn), "path", g_strdup(""), g_free);
-    g_signal_connect(copy_main_btn, "clicked", G_CALLBACK(on_copy_path), NULL);
-    gtk_style_context_add_class(gtk_widget_get_style_context(copy_main_btn), "bench-btn");
-    gtk_box_pack_start(GTK_BOX(opath_row), copy_main_btn, FALSE, FALSE, 0);
+    a->copy_path_btn = gtk_button_new_with_label("Copy Path");
+    g_object_set_data_full(G_OBJECT(a->copy_path_btn), "path", g_strdup(""), g_free);
+    g_signal_connect(a->copy_path_btn, "clicked", G_CALLBACK(on_copy_path), NULL);
+    gtk_style_context_add_class(gtk_widget_get_style_context(a->copy_path_btn), "bench-btn");
+    gtk_widget_set_halign(a->copy_path_btn, GTK_ALIGN_START);
+    gtk_widget_set_sensitive(a->copy_path_btn, FALSE);
+    gtk_box_pack_start(GTK_BOX(opath_box), a->copy_path_btn, FALSE, FALSE, 0);
 
-    gtk_box_pack_start(GTK_BOX(box), opath_row, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), opath_box, FALSE, FALSE, 0);
 
     gtk_box_pack_start(GTK_BOX(box), make_section("MODE"), FALSE, FALSE, 0);
     GtkWidget *trow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 0);
