@@ -45,7 +45,12 @@ int load_key(const char *path, uint8_t *key) {
         memcpy(key, "01234567890123456789012345678901", KEY_SIZE);
         return 0;
     }
-    (void)fread(key, 1, KEY_SIZE, f);
+    size_t read_bytes = fread(key, 1, KEY_SIZE, f);
+    if (read_bytes != KEY_SIZE) {
+        fprintf(stderr, "Error: Could not read %d bytes from %s\\n", KEY_SIZE, path);
+        fclose(f);
+        exit(1);
+    }
     fclose(f);
     printf("[INFO] Key loaded from: %s\n", path);
     return 0;
@@ -53,17 +58,28 @@ int load_key(const char *path, uint8_t *key) {
 
 // builds output filename
 // encrypt: file.pdf      → file.pdf.enc
-// decrypt: file.pdf.enc  → file.pdf
+// decrypt: file.pdf.enc  → file.pdf.dec
 void build_output_name(const char *input, char *output,
                        int encrypting) {
-    if (encrypting) {
-        sprintf(output, "%s.enc", input);
+    const char *base_name = strrchr(input, '/');
+    if (base_name) {
+        base_name++;
     } else {
-        // strip .enc
-        strcpy(output, input);
-        char *ext = strstr(output, ".enc");
-        if (ext) *ext = '\0';
+        base_name = input;
     }
+
+    char temp_name[512];
+    if (encrypting) {
+        sprintf(temp_name, "%s.enc", base_name);
+    } else {
+        strcpy(temp_name, base_name);
+        char *ext = strstr(temp_name, ".enc");
+        if (ext) strcpy(ext, ".dec");
+        else     strcat(temp_name, ".dec");
+    }
+
+    // Force output directory to the Windows Downloads folder
+    sprintf(output, "/mnt/c/Users/G L B/Downloads/%s", temp_name);
 }
 
 int main(int argc, char *argv[]) {
