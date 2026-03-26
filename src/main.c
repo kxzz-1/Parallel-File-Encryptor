@@ -53,17 +53,16 @@ int load_key(const char *path, uint8_t *key) {
 
 // builds output filename
 // encrypt: file.pdf      → file.pdf.enc
-// decrypt: file.pdf.enc  → file.pdf.dec
+// decrypt: file.pdf.enc  → file.pdf
 void build_output_name(const char *input, char *output,
                        int encrypting) {
     if (encrypting) {
         sprintf(output, "%s.enc", input);
     } else {
-        // strip .enc and add .dec
+        // strip .enc
         strcpy(output, input);
         char *ext = strstr(output, ".enc");
-        if (ext) strcpy(ext, ".dec");
-        else     strcat(output, ".dec");
+        if (ext) *ext = '\0';
     }
 }
 
