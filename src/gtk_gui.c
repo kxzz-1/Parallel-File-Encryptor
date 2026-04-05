@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #define CL_TARGET_OPENCL_VERSION 300
 #include <gtk/gtk.h>
 #include <stdio.h>
@@ -15,6 +16,7 @@ typedef struct {
     GtkWidget *window;
     GtkWidget *notebook;
     GtkWidget *input_entry;
+    GtkWidget *dest_entry;
     GtkWidget *encrypt_btn;
     GtkWidget *decrypt_btn;
     GtkWidget *run_btn;
@@ -63,10 +65,13 @@ typedef struct {
     FILE   *proc_pipe;
     guint   pipe_watch_id;
     int     is_running;
+    int     has_error;
+    char    error_msg[512];
 } App;
 
 // ── forward declarations ──
 static void     on_browse        (GtkButton *b, App *a);
+static void     on_browse_dest   (GtkButton *b, App *a);
 static void     on_encrypt_toggle(GtkButton *b, App *a);
 static void     on_decrypt_toggle(GtkButton *b, App *a);
 static void     on_mpi_changed   (GtkRange  *r, App *a);
@@ -81,6 +86,7 @@ static void     reset_ui         (App *a);
 static void     show_output_popup(App *a, const char *path, int encrypted);
 static gboolean read_pipe_cb     (GIOChannel *ch, GIOCondition cond, gpointer data);
 static gboolean anim_tick_cb     (gpointer data);
+static void     show_error_dialog(App *a, const char *msg);
 
 // ── output path helper ──
 static void build_output_path(const char *input, char *output, int encrypting) {
@@ -93,6 +99,7 @@ static void build_output_path(const char *input, char *output, int encrypting) {
         char bc[512]; g_strlcpy(bc, base, sizeof(bc));
         char *ext = strstr(bc, ".enc");
         if (ext) *ext = '\0';
+        else     strcat(bc, ".dec");
         g_snprintf(output, 512, "%s/%s", dir, bc);
     }
 }
@@ -167,6 +174,29 @@ static void show_output_popup(App *a, const char *path, int encrypted) {
     }
 
     gtk_widget_show_all(dlg);
+    gtk_dialog_run(GTK_DIALOG(dlg));
+    gtk_widget_destroy(dlg);
+}
+
+static void show_error_dialog(App *a, const char *msg) {
+    GtkWidget *dlg = gtk_message_dialog_new(
+        GTK_WINDOW(a->window), GTK_DIALOG_MODAL,
+        GTK_MESSAGE_ERROR, GTK_BUTTONS_OK,
+        NULL);
+    
+    gtk_window_set_title(GTK_WINDOW(dlg), "Operation Failed");
+    
+    // Set secondary text for the detailed specific message
+    gtk_message_dialog_set_markup(GTK_MESSAGE_DIALOG(dlg),
+        "<b><span size='large' foreground='#ef4444'>An error occurred during processing</span></b>");
+    
+    gtk_message_dialog_format_secondary_text(GTK_MESSAGE_DIALOG(dlg),
+        "%s", msg);
+
+    // Make it look a bit more modern
+    GtkStyleContext *sc = gtk_widget_get_style_context(dlg);
+    gtk_style_context_add_class(sc, "error-dialog");
+
     gtk_dialog_run(GTK_DIALOG(dlg));
     gtk_widget_destroy(dlg);
 }
@@ -368,6 +398,28 @@ static void on_browse(GtkButton *b, App *a) {
     gtk_widget_destroy(dlg);
 }
 
+static void on_browse_dest(GtkButton *b, App *a) {
+    GtkWidget *dlg = gtk_file_chooser_dialog_new(
+        "Select Destination File", GTK_WINDOW(a->window),
+        GTK_FILE_CHOOSER_ACTION_SAVE,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Save",   GTK_RESPONSE_ACCEPT, NULL);
+
+    gtk_file_chooser_set_do_overwrite_confirmation(GTK_FILE_CHOOSER(dlg), TRUE);
+    
+    if (strlen(a->input_path) > 0) {
+        char dir[512]; g_strlcpy(dir, a->input_path, sizeof(dir));
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(dlg), dirname(dir));
+    }
+
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dlg));
+        gtk_entry_set_text(GTK_ENTRY(a->dest_entry), fn);
+        g_free(fn);
+    }
+    gtk_widget_destroy(dlg);
+}
+
 static void on_encrypt_toggle(GtkButton *b, App *a) {
     a->encrypting = 1;
     gtk_button_set_label(GTK_BUTTON(a->run_btn), "Run Encrypt");
@@ -455,8 +507,73 @@ static int first_int(const char *s, int *out) {
     return 0;
 }
 
-// ── parse stdout line — robust keyword-based matching ──
+// ── parse stdout line — handle JSON if available ──
 static void parse_line(const char *line, App *a) {
+    if (line[0] == '{') {
+        // JSON mode
+        const char *st_p = strstr(line, "\"status\":");
+        if (st_p) {
+            if (strstr(st_p, "\"starting\"")) {
+                const char *tot_p = strstr(line, "\"total\":");
+                if (tot_p) {
+                    unsigned long long total = 0;
+                    sscanf(tot_p + 8, "%llu", &total);
+                    char buf[32];
+                    if (total > 1048576)      g_snprintf(buf, sizeof(buf), "%.1f MB", total/1048576.0);
+                    else if (total > 1024)    g_snprintf(buf, sizeof(buf), "%.1f KB", total/1024.0);
+                    else                      g_snprintf(buf, sizeof(buf), "%llu B", total);
+                    gchar *m = g_markup_printf_escaped("<b><span foreground='#ffffff' size='large'>%s</span></b>", buf);
+                    gtk_label_set_markup(GTK_LABEL(a->detail_filesize), m);
+                    g_free(m);
+                }
+            } else if (strstr(st_p, "\"progress\"")) {
+                const char *proc_p = strstr(line, "\"processed\":");
+                if (proc_p) {
+                    unsigned long long proc = 0;
+                    sscanf(proc_p + 12, "%llu", &proc);
+                    // Update a global progress or just status
+                    char buf[64];
+                    g_snprintf(buf, sizeof(buf), "Processing... %llu bytes", proc);
+                    gtk_label_set_text(GTK_LABEL(a->status_lbl), buf);
+                    // For the heatmap/animation, we keep the simulated wave moving
+                }
+            } else if (strstr(st_p, "\"complete\"")) {
+                const char *out_p = strstr(line, "\"output\":");
+                if (out_p) {
+                    char output[512];
+                    const char *start = strchr(out_p + 9, '"');
+                    if (start) {
+                        const char *end = strchr(start + 1, '"');
+                        if (end) {
+                            int len = (int)(end - start - 1);
+                            if (len > 511) len = 511;
+                            memcpy(output, start + 1, len);
+                            output[len] = '\0';
+                            g_strlcpy(a->last_output_path, output, sizeof(a->last_output_path));
+                        }
+                    }
+                }
+            } else if (strstr(st_p, "\"error\"")) {
+                a->has_error = 1;
+                const char *msg_p = strstr(line, "\"message\":");
+                if (msg_p) {
+                    const char *start = strchr(msg_p + 10, '"');
+                    if (start) {
+                        const char *end = strchr(start + 1, '"');
+                        if (end) {
+                            int len = (int)(end - start - 1);
+                            if (len > 511) len = 511;
+                            memcpy(a->error_msg, start + 1, len);
+                            a->error_msg[len] = '\0';
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    /* Fallback to legacy parsing for other lines */
     /* ── always dump to debug log so user can inspect exact format ── */
     static FILE *dbg = NULL;
     if (!dbg) dbg = fopen("/tmp/encrypter_gui_debug.log", "w");
@@ -598,6 +715,19 @@ static void parse_line(const char *line, App *a) {
                 gtk_widget_queue_draw(a->heatmap_area);
             }
         }
+    }
+
+    /* ─────────────────────────────────────────────────────────────
+       ERROR DETECTION
+       ───────────────────────────────────────────────────────────── */
+    if (strcasestr(line, "[ERROR]") || strcasestr(line, "fail") || strcasestr(line, "invalid")) {
+        a->has_error = 1;
+        const char *msg = strcasestr(line, "[ERROR]");
+        if (msg) msg += 7;
+        else     msg = line;
+        
+        while (*msg == ' ' || *msg == ':' || *msg == '[') msg++;
+        g_strlcpy(a->error_msg, msg, sizeof(a->error_msg));
     }
 
     /* ─────────────────────────────────────────────────────────────
@@ -768,10 +898,25 @@ static gboolean read_pipe_cb(GIOChannel *ch, GIOCondition cond, gpointer data) {
             gtk_widget_queue_draw(a->graph_area);
         }
 
+        if (a->proc_pipe) {
+            int status = pclose(a->proc_pipe);
+            a->proc_pipe = NULL;
+            /* If the process returned non-zero, it's an error even if no [ERROR] line was parsed */
+            if (WIFEXITED(status) && WEXITSTATUS(status) != 0) {
+                a->has_error = 1;
+            }
+        }
+
         gtk_widget_set_sensitive(a->run_btn,   TRUE);
         gtk_widget_set_sensitive(a->bench_btn, TRUE);
-        gtk_label_set_markup(GTK_LABEL(a->status_lbl),
-            "<span foreground='#00e5a0' size='small'>Done!</span>");
+        
+        if (a->has_error) {
+            gtk_label_set_markup(GTK_LABEL(a->status_lbl),
+                "<span foreground='#ef4444' size='small'>Failed!</span>");
+        } else {
+            gtk_label_set_markup(GTK_LABEL(a->status_lbl),
+                "<span foreground='#00e5a0' size='small'>Done!</span>");
+        }
 
         /* final redraw */
         gtk_widget_queue_draw(a->split_area);
@@ -779,7 +924,9 @@ static gboolean read_pipe_cb(GIOChannel *ch, GIOCondition cond, gpointer data) {
         gtk_widget_queue_draw(a->graph_area);
 
         /* show completion popup — always derive path from input as fallback */
-        if (strlen(a->input_path) > 0) {
+        if (a->has_error) {
+            show_error_dialog(a, strlen(a->error_msg) > 0 ? a->error_msg : "An unknown error occurred during execution.");
+        } else if (strlen(a->input_path) > 0) {
             char derived_path[512];
             build_output_path(a->input_path, derived_path, a->encrypting);
             const char *popup_path = (strlen(a->last_output_path) > 0)
@@ -842,22 +989,29 @@ static void launch_process(App *a, int bench) {
         g_free(tm);
     }
 
+    const char *dest  = gtk_entry_get_text(GTK_ENTRY(a->dest_entry));
+
     g_strlcpy(a->last_output_path, "", sizeof(a->last_output_path));
     a->run_start_us = g_get_monotonic_time();
     a->is_bench     = bench;
+    a->has_error    = 0;
+    memset(a->error_msg, 0, sizeof(a->error_msg));
 
     int mpi = (int)gtk_range_get_value(GTK_RANGE(a->mpi_scale));
-    char cmd[1536];
+    char cmd[2048];
     const char *encrypter = "./encrypter";
+
+    char dest_arg[600] = "";
+    if (strlen(dest) > 0) g_snprintf(dest_arg, sizeof(dest_arg), "-o \"%s\"", dest);
 
     if (bench)
         g_snprintf(cmd, sizeof(cmd),
-            "mpirun -np %d %s %s \"%s\" --bench 2>&1",
-            mpi, encrypter, a->encrypting ? "-e" : "-d", input);
+            "mpirun -np %d %s %s \"%s\" %s --bench --json 2>&1",
+            mpi, encrypter, a->encrypting ? "-e" : "-d", input, dest_arg);
     else
         g_snprintf(cmd, sizeof(cmd),
-            "mpirun -np %d %s %s \"%s\" 2>&1",
-            mpi, encrypter, a->encrypting ? "-e" : "-d", input);
+            "mpirun -np %d %s %s \"%s\" %s --json 2>&1",
+            mpi, encrypter, a->encrypting ? "-e" : "-d", input, dest_arg);
 
     FILE *pipe = popen(cmd, "r");
     if (!pipe) {
@@ -1297,6 +1451,17 @@ static GtkWidget *build_left(App *a) {
     gtk_box_pack_start(GTK_BOX(frow), a->input_entry, TRUE, TRUE, 0);
     gtk_box_pack_start(GTK_BOX(frow), browse, FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(box), frow, FALSE, FALSE, 0);
+
+    gtk_box_pack_start(GTK_BOX(box), make_section("DESTINATION (OPTIONAL)"), FALSE, FALSE, 0);
+    GtkWidget *drow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);
+    a->dest_entry = gtk_entry_new();
+    gtk_entry_set_placeholder_text(GTK_ENTRY(a->dest_entry), "Default: auto-named");
+    gtk_widget_set_hexpand(a->dest_entry, TRUE);
+    GtkWidget *browse_dest = gtk_button_new_with_label("Save As");
+    g_signal_connect(browse_dest, "clicked", G_CALLBACK(on_browse_dest), a);
+    gtk_box_pack_start(GTK_BOX(drow), a->dest_entry, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(drow), browse_dest, FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(box), drow, FALSE, FALSE, 0);
 
     GtkWidget *opath_box = gtk_box_new(GTK_ORIENTATION_VERTICAL, 4);
     GtkWidget *opath_row = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 6);

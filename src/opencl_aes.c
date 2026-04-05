@@ -2,14 +2,32 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+#include <libgen.h>
 #include "opencl_aes.h"
 #include "serial_aes.h"
 
+// helper: find kernel relative to binary
+static void get_kernel_full_path(char *out) {
+    char buf[512];
+    ssize_t len = readlink("/proc/self/exe", buf, sizeof(buf)-1);
+    if (len != -1) {
+        buf[len] = '\0';
+        char *dir = dirname(buf);
+        sprintf(out, "%s/kernels/aes_kernel.cl", dir);
+    } else {
+        strcpy(out, "kernels/aes_kernel.cl");
+    }
+}
+
 // loads the kernel source from file
-static char *load_kernel_source(const char *path) {
+static char *load_kernel_source() {
+    char path[512];
+    get_kernel_full_path(path);
     FILE *f = fopen(path, "rb");
+
     if (!f) {
-        fprintf(stderr, "[ERROR] Cannot open kernel: %s\n", path);
+        fprintf(stderr, "[ERROR] OpenCL Error: Could not find the AES kernel file at: %s. Please check your installation.\n", path);
         return NULL;
     }
     fseek(f, 0, SEEK_END);
@@ -23,7 +41,7 @@ static char *load_kernel_source(const char *path) {
     }
     size_t read_bytes = fread(src, 1, size, f);
     if (read_bytes != (size_t)size) {
-        fprintf(stderr, "[ERROR] Could not read entire kernel: %s\\n", path);
+        fprintf(stderr, "[ERROR] OpenCL Error: Could not load the AES kernel source code from: %s.\n", path);
         free(src);
         fclose(f);
         return NULL;
@@ -40,14 +58,14 @@ int opencl_init(OpenCLContext *ctx) {
 
     err = clGetPlatformIDs(1, &ctx->platform, NULL);
     if (err != CL_SUCCESS) {
-        fprintf(stderr, "[ERROR] No OpenCL platform found\n");
+        fprintf(stderr, "[ERROR] OpenCL Error: No compatible OpenCL platform was found on your system. Please ensure drivers are installed correctly.\n");
         return -1;
     }
 
     err = clGetDeviceIDs(ctx->platform, CL_DEVICE_TYPE_GPU,
                          1, &ctx->device, NULL);
     if (err != CL_SUCCESS) {
-        fprintf(stderr, "[ERROR] No OpenCL GPU found\n");
+        fprintf(stderr, "[ERROR] OpenCL Error: No compatible GPU was found. Ensure your drivers support OpenCL, or use CPU mode.\n");
         return -1;
     }
 
@@ -66,7 +84,8 @@ int opencl_init(OpenCLContext *ctx) {
     if (err != CL_SUCCESS) return -1;
 
     // load and build kernel
-    char *src = load_kernel_source("kernels/aes_kernel.cl");
+    char *src = load_kernel_source();
+
     if (!src) return -1;
 
     ctx->program = clCreateProgramWithSource(
@@ -87,7 +106,7 @@ int opencl_init(OpenCLContext *ctx) {
         clGetProgramBuildInfo(ctx->program, ctx->device,
                               CL_PROGRAM_BUILD_LOG,
                               log_size, log, NULL);
-        fprintf(stderr, "[ERROR] Kernel build failed:\n%s\n", log);
+        fprintf(stderr, "[ERROR] OpenCL Compilation Error: Failed to build the encryption kernel. Details:\n%s\n", log);
         free(log);
         return -1;
     }

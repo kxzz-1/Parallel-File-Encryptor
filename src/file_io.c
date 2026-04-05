@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <openssl/hmac.h>
 #include "file_io.h"
 
 // reads any file into memory — works for ALL file types
@@ -10,7 +11,7 @@ FileBuffer read_file(const char *path) {
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "[ERROR] Cannot open file: %s\n", path);
+        fprintf(stderr, "[ERROR] Failed to open file for reading: %s. Check if the file exists and you have permissions.\n", path);
         return buf;
     }
 
@@ -22,7 +23,7 @@ FileBuffer read_file(const char *path) {
     // load entire file into memory
     buf.data = (uint8_t *)malloc(buf.size);
     if (!buf.data) {
-        fprintf(stderr, "[ERROR] Not enough memory\n");
+        fprintf(stderr, "[ERROR] Memory allocation failed. The file might be too large for your system's available RAM.\n");
         fclose(f);
         buf.size = 0;
         return buf;
@@ -30,7 +31,7 @@ FileBuffer read_file(const char *path) {
 
     size_t read_bytes = fread(buf.data, 1, buf.size, f);
     if (read_bytes != buf.size) {
-        fprintf(stderr, "[ERROR] Could not read entire file: %s\\n", path);
+        fprintf(stderr, "[ERROR] Read operation interrupted or file is corrupted: %s\n", path);
         free(buf.data);
         buf.data = NULL;
         fclose(f);
@@ -66,14 +67,12 @@ int write_encrypted_file(const char *path, FileHeader *header,
                          uint8_t *data, uint64_t size) {
     FILE *f = fopen(path, "wb");
     if (!f) {
-        fprintf(stderr, "[ERROR] Cannot create: %s\n", path);
+        fprintf(stderr, "[ERROR] Failed to create output file: %s. Check disk space and folder permissions.\n", path);
         return -1;
     }
 
-    fwrite(header->magic,          1, MAGIC_SIZE,       f);
-    fwrite(header->nonce,          1, NONCE_SIZE,       f);
-    fwrite(&header->original_size, 1, sizeof(uint64_t), f);
-    fwrite(data,                   1, size,             f);
+    fwrite(header, 1, sizeof(FileHeader), f);
+    fwrite(data,   1, size,               f);
     fclose(f);
 
     printf("[OK] Encrypted file written: %s\n", path);
@@ -86,14 +85,12 @@ FileHeader read_header(const char *path) {
 
     FILE *f = fopen(path, "rb");
     if (!f) {
-        fprintf(stderr, "[ERROR] Cannot open: %s\n", path);
+        fprintf(stderr, "[ERROR] Failed to open encrypted file: %s.\n", path);
         return header;
     }
 
-    if (fread(header.magic,          1, MAGIC_SIZE,       f) != MAGIC_SIZE ||
-        fread(header.nonce,          1, NONCE_SIZE,       f) != NONCE_SIZE ||
-        fread(&header.original_size, 1, sizeof(uint64_t), f) != sizeof(uint64_t)) {
-        fprintf(stderr, "[ERROR] Failed to read complete header from: %s\\n", path);
+    if (fread(&header, 1, sizeof(FileHeader), f) != sizeof(FileHeader)) {
+        fprintf(stderr, "[ERROR] File header is incomplete or corrupted in: %s. This is likely not a valid encrypted file.\n", path);
         fclose(f);
         memset(&header, 0, sizeof(header));
         return header;
@@ -102,7 +99,7 @@ FileHeader read_header(const char *path) {
 
     // verify this is actually our encrypted file
     if (memcmp(header.magic, MAGIC, MAGIC_SIZE) != 0) {
-        fprintf(stderr, "[ERROR] Invalid file — not encrypted by this program\n");
+        fprintf(stderr, "[ERROR] Validation failed: This file was not encrypted by this program (invalid magic bytes).\n");
         memset(&header, 0, sizeof(header));
     }
 
@@ -116,6 +113,11 @@ uint8_t *read_encrypted_data(const char *path, uint64_t *out_size) {
 
     fseek(f, 0, SEEK_END);
     long total  = ftell(f);
+    if (total < HEADER_SIZE) {
+        fprintf(stderr, "[ERROR] File Size Error: The file '%s' is too small to contain the required encryption header.\n", path);
+        fclose(f);
+        return NULL;
+    }
     *out_size   = (uint64_t)(total - HEADER_SIZE);
     fseek(f, HEADER_SIZE, SEEK_SET);
 
@@ -123,7 +125,7 @@ uint8_t *read_encrypted_data(const char *path, uint64_t *out_size) {
     if (!data) { fclose(f); return NULL; }
 
     if (fread(data, 1, *out_size, f) != *out_size) {
-        fprintf(stderr, "[ERROR] Could not read encrypted data from: %s\\n", path);
+        fprintf(stderr, "[ERROR] Failed to read the encrypted data block from: %s.\n", path);
         free(data);
         fclose(f);
         return NULL;
@@ -136,7 +138,7 @@ uint8_t *read_encrypted_data(const char *path, uint64_t *out_size) {
 int write_decrypted_file(const char *path, uint8_t *data, uint64_t size) {
     FILE *f = fopen(path, "wb");
     if (!f) {
-        fprintf(stderr, "[ERROR] Cannot create: %s\n", path);
+        fprintf(stderr, "[ERROR] Failed to create output file: %s. Check disk space and folder permissions.\n", path);
         return -1;
     }
     fwrite(data, 1, size, f);

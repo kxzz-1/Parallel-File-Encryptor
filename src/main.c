@@ -1,8 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <mpi.h>
 #include <omp.h>
+#include <libgen.h>
 #include "file_io.h"
 #include "strategy.h"
 #include "serial_aes.h"
@@ -10,8 +12,12 @@
 #include "omp_scheduler.h"
 #include "opencl_aes.h"
 #include "benchmark.h"
+#include <openssl/hmac.h>
+#include <openssl/evp.h>
+#include <openssl/params.h>
 
 #define KEY_SIZE 32
+#define STREAM_CHUNK_SIZE (64 * 1024 * 1024) // 64MB pulses
 
 // prints usage instructions
 void print_usage(const char *prog) {
@@ -32,6 +38,7 @@ void print_usage(const char *prog) {
     printf("  --serial  force serial mode\n");
     printf("  --cpu     force MPI + OpenMP mode\n");
     printf("  --gpu     force MPI + OpenCL mode\n");
+    printf("  --json    machine-readable status output\n");
     printf("\n");
 }
 
@@ -57,29 +64,29 @@ int load_key(const char *path, uint8_t *key) {
 }
 
 // builds output filename
-// encrypt: file.pdf      → file.pdf.enc
-// decrypt: file.pdf.enc  → file.pdf.dec
+// encrypt: file.pdf      → file.pdf.enc (same folder)
+// decrypt: file.pdf.enc  → file.pdf     (same folder)
 void build_output_name(const char *input, char *output,
                        int encrypting) {
-    const char *base_name = strrchr(input, '/');
-    if (base_name) {
-        base_name++;
-    } else {
-        base_name = input;
-    }
+    char path_tmp1[512], path_tmp2[512];
+    strcpy(path_tmp1, input);
+    strcpy(path_tmp2, input);
+
+    char *dir  = dirname(path_tmp1);
+    char *base = basename(path_tmp2);
 
     char temp_name[512];
     if (encrypting) {
-        sprintf(temp_name, "%s.enc", base_name);
+        sprintf(temp_name, "%s.enc", base);
     } else {
-        strcpy(temp_name, base_name);
+        strcpy(temp_name, base);
+        // if starts with/contains .enc, remove it for decryption
         char *ext = strstr(temp_name, ".enc");
-        if (ext) strcpy(ext, ".dec");
+        if (ext) *ext = '\0';
         else     strcat(temp_name, ".dec");
     }
 
-    // Force output directory to the Windows Downloads folder
-    sprintf(output, "/mnt/c/Users/G L B/Downloads/%s", temp_name);
+    sprintf(output, "%s/%s", dir, temp_name);
 }
 
 int main(int argc, char *argv[]) {
@@ -94,18 +101,22 @@ int main(int argc, char *argv[]) {
     // ── Parse arguments ─────────────────────
     char    *input_file  = NULL;
     char    *key_file    = NULL;
+    char    *output_file_arg = NULL;
     int      encrypting  = 1;    // 1=encrypt, 0=decrypt
     int      bench_mode  = 0;
     int      force_mode  = -1;   // -1=auto, 0=serial, 1=cpu, 2=gpu
+    int      json_mode   = 0;
 
     for (int i = 1; i < argc; i++) {
         if      (!strcmp(argv[i], "-e"))       { encrypting = 1; input_file = argv[++i]; }
         else if (!strcmp(argv[i], "-d"))       { encrypting = 0; input_file = argv[++i]; }
+        else if (!strcmp(argv[i], "-o"))       { output_file_arg = argv[++i]; }
         else if (!strcmp(argv[i], "-k"))       { key_file = argv[++i]; }
         else if (!strcmp(argv[i], "--bench"))  { bench_mode  = 1; }
         else if (!strcmp(argv[i], "--serial")) { force_mode  = 0; }
         else if (!strcmp(argv[i], "--cpu"))    { force_mode  = 1; }
         else if (!strcmp(argv[i], "--gpu"))    { force_mode  = 2; }
+        else if (!strcmp(argv[i], "--json"))   { json_mode   = 1; }
     }
 
     if (!input_file && rank == 0) {
@@ -118,159 +129,193 @@ int main(int argc, char *argv[]) {
     uint8_t key[KEY_SIZE];
     load_key(key_file, key);
 
-    // ── Detect hardware ─────────────────────
-    uint64_t gpu_mem     = 0;
-    int      gpu_available = detect_gpu(&gpu_mem);
-    int      cpu_cores   = omp_get_max_threads();
+    // ── Pre-calculate sizes ──────────────────
+    uint64_t total_size = 0;
+    FILE *f_in = NULL;
+    FILE *f_out = NULL;
+    FileHeader header = {0};
 
-    // ── Read file and decide strategy ───────
-    FileBuffer file = {NULL, 0};
     if (rank == 0) {
-        if (encrypting) {
-            file = read_file(input_file);
-        } else {
-            // for decryption read only data after header
-            uint64_t enc_size = 0;
-            uint8_t *enc_data = read_encrypted_data(input_file,
-                                                    &enc_size);
-            file.data = enc_data;
-            file.size = enc_size;
+        f_in = fopen(input_file, "rb");
+        if (!f_in) {
+            fprintf(stderr, "[ERROR] Could not open input file: %s (errno: %d)\n", input_file, errno);
+            MPI_Abort(MPI_COMM_WORLD, 1);
         }
+
+        if (encrypting) {
+            fseek(f_in, 0, SEEK_END);
+            total_size = (uint64_t)ftell(f_in);
+            fseek(f_in, 0, SEEK_SET);
+
+            memcpy(header.magic, MAGIC, MAGIC_SIZE);
+            generate_nonce(header.nonce);
+            header.original_size = total_size;
+        } else {
+            header = read_header(input_file);
+            if (header.original_size == 0) {
+                fprintf(stderr, "[ERROR] Header validation failed for %s. Aborting.\n", input_file);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            total_size = header.original_size;
+            fseek(f_in, HEADER_SIZE, SEEK_SET);
+        }
+        printf("[DEBUG] Rank 0: total_size = %llu, mode = %s\n", 
+               (unsigned long long)total_size, encrypting ? "ENCRYPT" : "DECRYPT");
     }
 
-    // broadcast file size to all processes
-    MPI_Bcast(&file.size, 1, MPI_UINT64_T, 0, MPI_COMM_WORLD);
+    MPI_Bcast(&total_size, 1, MPI_UNSIGNED_LONG_LONG, 0, MPI_COMM_WORLD);
+    
+    // Broadcast nonce for all modes
+    uint8_t nonce[16];
+    if (rank == 0) memcpy(nonce, header.nonce, 16);
+    MPI_Bcast(nonce, 16, MPI_BYTE, 0, MPI_COMM_WORLD);
 
-    // decide strategy based on runtime info
-    Strategy s = decide_strategy(file.size, nprocs,
-                                 cpu_cores, gpu_available,
-                                 gpu_mem);
-
-    // override strategy if user forced a mode
+    // ── Decide strategy ─────────────────────
+    // Detect hardware
+    uint64_t gpu_mem = 0;
+    int gpu_available = detect_gpu(&gpu_mem);
+    int cpu_cores = omp_get_max_threads();
+    Strategy s = decide_strategy(total_size, nprocs, cpu_cores, gpu_available, gpu_mem);
+    
     if (force_mode == 0) s.mode = MODE_SERIAL;
     if (force_mode == 1) s.mode = MODE_MPI_OPENMP;
     if (force_mode == 2) s.mode = MODE_MPI_OPENCL;
-
-    // print what we decided
     if (rank == 0) print_strategy(&s);
 
-    // ── Benchmark mode ──────────────────────
+    // ── Benchmark Mode ──────────────────────
     if (bench_mode) {
-        if (rank == 0) printf("[BENCH] Starting benchmark...\n");
+        if (rank == 0) printf("[BENCH] Starting benchmark comparison...\n");
         BenchmarkResult r = benchmark_run(input_file, key, &s);
         if (rank == 0) benchmark_print(&r);
-        free_buffer(&file);
         MPI_Finalize();
         return 0;
     }
 
-    // ── Build output filename ───────────────
+    // ── Prep Output ─────────────────────────
     char output_file[512];
-    build_output_name(input_file, output_file, encrypting);
-
-    // ── Get nonce ───────────────────────────
-    uint8_t nonce[16] = {0};
-
-    if (encrypting) {
-        // generate fresh nonce for encryption
-        if (rank == 0) generate_nonce(nonce);
-        // broadcast nonce so all processes use same one
-        MPI_Bcast(nonce, 16, MPI_BYTE, 0, MPI_COMM_WORLD);
+    if (output_file_arg) {
+        snprintf(output_file, sizeof(output_file), "%s", output_file_arg);
     } else {
-        // read nonce from encrypted file header
-        if (rank == 0) {
-            FileHeader h = read_header(input_file);
-            memcpy(nonce, h.nonce, 16);
-        }
-        MPI_Bcast(nonce, 16, MPI_BYTE, 0, MPI_COMM_WORLD);
+        build_output_name(input_file, output_file, encrypting);
     }
-
-    // ── Run encryption/decryption ────────────
-    uint8_t  *final_output = NULL;
-    uint64_t  final_size   = 0;
-
-    if (s.mode == MODE_SERIAL) {
-        // serial — only master runs
-        if (rank == 0) {
-            final_output = (uint8_t *)malloc(file.size);
-            aes_ctr_encrypt(file.data, final_output,
-                            file.size, key, nonce, 0);
-            final_size = file.size;
-            printf("[OK] Serial encryption done\n");
-        }
-
-    } else if (s.mode == MODE_MPI_OPENMP) {
-        // distribute chunks
-        Chunk chunk;
-        mpi_scatter_file(&file, &chunk, &s, rank, nprocs);
-
-        // encrypt chunk with OpenMP threads
-        uint8_t *chunk_out = (uint8_t *)malloc(chunk.size);
-        omp_encrypt_chunk(&chunk, chunk_out, key, nonce, &s);
-
-        // swap encrypted data back into chunk
-        memcpy(chunk.data, chunk_out, chunk.size);
-        free(chunk_out);
-
-        // gather results to master
-        mpi_gather_results(&chunk, &final_output,
-                           &final_size, &s, rank, nprocs);
-        free_chunk(&chunk);
-
-    } else if (s.mode == MODE_MPI_OPENCL) {
-        // init GPU
-        OpenCLContext ctx;
-        int ok = opencl_init(&ctx);
-
-        if (ok != 0) {
-            // GPU init failed — fallback to OpenMP
-            if (rank == 0)
-                printf("[WARN] GPU init failed, "
-                       "falling back to OpenMP\n");
-            s.mode = MODE_MPI_OPENMP;
-        }
-
-        Chunk chunk;
-        mpi_scatter_file(&file, &chunk, &s, rank, nprocs);
-
-        uint8_t *chunk_out = (uint8_t *)malloc(chunk.size);
-
-        if (ctx.ready)
-            opencl_encrypt_chunk(&ctx, &chunk, chunk_out,
-                                 key, nonce, &s);
-        else
-            omp_encrypt_chunk(&chunk, chunk_out, key, nonce, &s);
-
-        memcpy(chunk.data, chunk_out, chunk.size);
-        free(chunk_out);
-
-        mpi_gather_results(&chunk, &final_output,
-                           &final_size, &s, rank, nprocs);
-
-        free_chunk(&chunk);
-        opencl_cleanup(&ctx);
-    }
-
-    // ── Write output file (master only) ─────
-    if (rank == 0 && final_output) {
+    if (rank == 0) {
+        f_out = fopen(output_file, "wb");
         if (encrypting) {
-            FileHeader header;
-            memcpy(header.magic, MAGIC, MAGIC_SIZE);
-            memcpy(header.nonce, nonce, NONCE_SIZE);
-            header.original_size = file.size;
-            write_encrypted_file(output_file, &header,
-                                 final_output, final_size);
-        } else {
-            // trim to original size on decrypt
-            FileHeader h = read_header(input_file);
-            write_decrypted_file(output_file,
-                                 final_output,
-                                 h.original_size);
+            // Write placeholder header, will seek back and update HMAC later
+            fwrite(&header, 1, HEADER_SIZE, f_out);
         }
-        free(final_output);
     }
 
-    free_buffer(&file);
+    // ── Streaming Loop ──────────────────────
+    EVP_MAC *mac = EVP_MAC_fetch(NULL, "HMAC", NULL);
+    EVP_MAC_CTX *mctx = EVP_MAC_CTX_new(mac);
+    OSSL_PARAM params[2];
+    params[0] = OSSL_PARAM_construct_utf8_string("digest", "SHA256", 0);
+    params[1] = OSSL_PARAM_construct_end();
+    EVP_MAC_init(mctx, key, KEY_SIZE, params);
+
+    uint64_t processed = 0;
+    uint8_t *stream_buffer = (rank == 0) ? malloc(STREAM_CHUNK_SIZE) : NULL;
+
+    if (rank == 0 && json_mode) printf("{\"status\": \"starting\", \"total\": %llu}\n", (unsigned long long)total_size);
+
+    OpenCLContext ctx;
+    if (s.mode == MODE_MPI_OPENCL) {
+        if (opencl_init(&ctx) != 0) s.mode = MODE_MPI_OPENMP;
+    }
+
+    while (processed < total_size) {
+        uint64_t chunk_size = (total_size - processed > STREAM_CHUNK_SIZE) 
+                               ? STREAM_CHUNK_SIZE : (total_size - processed);
+        
+        FileBuffer fb = {NULL, chunk_size};
+        if (rank == 0) {
+            if (fread(stream_buffer, 1, chunk_size, f_in) != chunk_size) {
+                fprintf(stderr, "[ERROR] Read error at %llu\n", (unsigned long long)processed);
+                MPI_Abort(MPI_COMM_WORLD, 1);
+            }
+            fb.data = stream_buffer;
+            if (!encrypting) EVP_MAC_update(mctx, stream_buffer, chunk_size);
+        }
+
+        // Parallel processing of this pulse
+        uint8_t *processed_chunk = NULL;
+        if (s.mode == MODE_SERIAL) {
+            if (rank == 0) {
+                processed_chunk = malloc(chunk_size);
+                aes_ctr_encrypt(fb.data, processed_chunk, chunk_size, key, nonce, processed/16);
+            }
+        } else {
+            Chunk chunk;
+            mpi_scatter_file(&fb, &chunk, &s, rank, nprocs);
+            chunk.counter_offset = (processed + chunk.offset) / 16;
+            
+            uint8_t *chunk_out = malloc(chunk.size);
+            if (s.mode == MODE_MPI_OPENCL && ctx.ready)
+                opencl_encrypt_chunk(&ctx, &chunk, chunk_out, key, nonce, &s);
+            else
+                omp_encrypt_chunk(&chunk, chunk_out, key, nonce, &s);
+            
+            memcpy(chunk.data, chunk_out, chunk.size);
+            free(chunk_out);
+            
+            uint64_t gathered_size;
+            mpi_gather_results(&chunk, &processed_chunk, &gathered_size, &s, rank, nprocs);
+            free_chunk(&chunk);
+        }
+
+        if (rank == 0 && processed_chunk) {
+            if (encrypting) EVP_MAC_update(mctx, processed_chunk, chunk_size);
+            fwrite(processed_chunk, 1, chunk_size, f_out);
+            if (json_mode) printf("{\"status\": \"progress\", \"processed\": %llu}\n", (unsigned long long)(processed + chunk_size));
+            else printf("[INFO] Processed %llu/%llu bytes\n", (unsigned long long)(processed + chunk_size), (unsigned long long)total_size);
+            free(processed_chunk);
+        }
+        processed += chunk_size;
+    }
+
+    // ── Finalize ────────────────────────────
+    if (rank == 0) {
+        if (encrypting) {
+            // Auth header metadata too
+            EVP_MAC_update(mctx, header.magic, MAGIC_SIZE);
+            EVP_MAC_update(mctx, header.nonce, NONCE_SIZE);
+            EVP_MAC_update(mctx, (uint8_t*)&header.original_size, sizeof(uint64_t));
+            size_t hmac_len_out;
+            EVP_MAC_final(mctx, header.hmac, &hmac_len_out, 32);
+            
+            fseek(f_out, 0, SEEK_SET);
+            fwrite(&header, 1, HEADER_SIZE, f_out);
+            if (json_mode) printf("{\"status\": \"complete\", \"output\": \"%s\"}\n", output_file);
+            else printf("[OK] Encryption complete. HMAC: ");
+        } else {
+            uint8_t computed_hmac[32];
+            EVP_MAC_update(mctx, header.magic, MAGIC_SIZE);
+            EVP_MAC_update(mctx, header.nonce, NONCE_SIZE);
+            EVP_MAC_update(mctx, (uint8_t*)&header.original_size, sizeof(uint64_t));
+            size_t hmac_len_out;
+            EVP_MAC_final(mctx, computed_hmac, &hmac_len_out, 32);
+            
+            if (memcmp(computed_hmac, header.hmac, 32) != 0) {
+                fprintf(stderr, "[ERROR] Integrity check FAILED! The file has been tampered with or the key is wrong.\n");
+                if (json_mode) printf("{\"status\": \"error\", \"message\": \"Integrity check failed\"}\n");
+                fclose(f_out); f_out = NULL;
+                remove(output_file);
+            } else {
+                if (json_mode) printf("{\"status\": \"complete\", \"output\": \"%s\"}\n", output_file);
+                else printf("[OK] Decryption complete. Integrity verified.\n");
+            }
+        }
+        
+        if (f_in) { fclose(f_in); f_in = NULL; }
+        if (f_out) { fclose(f_out); f_out = NULL; }
+        free(stream_buffer);
+        // free(out_buffer); // mpi_gather_results might have allocated this, need to be careful
+    }
+
+    if (s.mode == MODE_MPI_OPENCL) opencl_cleanup(&ctx);
+    EVP_MAC_CTX_free(mctx);
+    EVP_MAC_free(mac);
     MPI_Finalize();
     return 0;
 }

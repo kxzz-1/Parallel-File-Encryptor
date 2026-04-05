@@ -1,6 +1,6 @@
 CC         = mpicc
 CFLAGS     = -Wall -O2 -Iinclude -fopenmp
-LDFLAGS    = -fopenmp -lOpenCL
+LDFLAGS    = -fopenmp -lOpenCL -lcrypto
 
 GUI_SRC    = src/gtk_gui.c
 GUI_TARGET = encrypter_gui

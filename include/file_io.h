@@ -9,13 +9,15 @@
 #define MAGIC        "PENC"
 #define MAGIC_SIZE   4
 #define NONCE_SIZE   16
-#define HEADER_SIZE  (MAGIC_SIZE + NONCE_SIZE + sizeof(uint64_t))
+#define HMAC_SIZE    32
+#define HEADER_SIZE  (MAGIC_SIZE + NONCE_SIZE + sizeof(uint64_t) + HMAC_SIZE)
 
 // the first 28 bytes of every encrypted file on disk
-typedef struct {
+typedef struct __attribute__((packed)) {
     uint8_t  magic[MAGIC_SIZE];
     uint8_t  nonce[NONCE_SIZE];
     uint64_t original_size;
+    uint8_t  hmac[HMAC_SIZE];
 } FileHeader;
 
 // holds a file's raw bytes in memory

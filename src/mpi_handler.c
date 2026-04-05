@@ -60,7 +60,7 @@ void mpi_scatter_file(FileBuffer *file, Chunk *chunk,
     chunk->data           = (uint8_t *)malloc(chunk->size);
 
     if (!chunk->data) {
-        fprintf(stderr, "[ERROR] Process %d: malloc failed\n", rank);
+        fprintf(stderr, "[ERROR] MPI Process %d: Failed to allocate memory for localized data chunk.\n", rank);
         MPI_Abort(MPI_COMM_WORLD, 1);
     }
 
@@ -116,7 +116,7 @@ void mpi_gather_results(Chunk *chunk, uint8_t **output,
 
         *output = (uint8_t *)malloc(*total_size);
         if (!*output) {
-            fprintf(stderr, "[ERROR] Master: gather malloc failed\n");
+            fprintf(stderr, "[ERROR] MPI Master: Failed to allocate memory to gather parallel results from all processes.\n");
             MPI_Abort(MPI_COMM_WORLD, 1);
         }
     }
