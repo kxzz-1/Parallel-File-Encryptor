@@ -121,9 +121,11 @@ BenchmarkResult benchmark_run(const char *filepath,
 }
 
 // prints a clean benchmark results table
+// Also emits JSON events if json_mode is set (passed via stdout)
 void benchmark_print(BenchmarkResult *r) {
     if (r->serial_time == 0) return;
 
+    /* ── Pretty text table ── */
     printf("\n");
     printf("╔══════════════════════════════════════════╗\n");
     printf("║           Benchmark Results               ║\n");
@@ -149,4 +151,25 @@ void benchmark_print(BenchmarkResult *r) {
     printf("║ GPU speedup  :       %6.2fx              ║\n",
            r->speedup_gpu);
     printf("╚══════════════════════════════════════════╝\n\n");
+
+    /* ── JSON events for GUI dashboard ── */
+    /* Emit timing packets so backend_parser can drive the Analysis tab */
+    if (r->serial_time > 0)
+        printf("{\"status\": \"timing\", \"mode\": \"serial\", \"time\": %.4f}\n",
+               r->serial_time);
+    if (r->cpu_time > 0)
+        printf("{\"status\": \"timing\", \"mode\": \"cpu\", \"time\": %.4f}\n",
+               r->cpu_time);
+    if (r->gpu_time > 0)
+        printf("{\"status\": \"timing\", \"mode\": \"gpu\", \"time\": %.4f}\n",
+               r->gpu_time);
+
+    /* Strategy summary for the strategy card */
+    printf("{\"status\": \"strategy\", \"mode\": \"MPI+OpenMP\", "
+           "\"mpi_procs\": %d, \"omp_threads\": %d, "
+           "\"gpu\": %d, \"gpu_vram\": 0, \"file_size\": %llu}\n",
+           r->mpi_procs, r->cpu_threads,
+           (r->gpu_time > 0 ? 1 : 0),
+           (unsigned long long)r->file_size);
+    fflush(stdout);
 }

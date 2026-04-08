@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <time.h>
 #include <mpi.h>
 #include <omp.h>
 #include <libgen.h>
@@ -182,6 +183,21 @@ int main(int argc, char *argv[]) {
     if (force_mode == 2) s.mode = MODE_MPI_OPENCL;
     if (rank == 0) print_strategy(&s);
 
+    /* ── Emit strategy JSON for GUI ── */
+    if (rank == 0 && json_mode) {
+        const char *mode_str = "MPI+OpenMP";
+        if      (s.mode == MODE_SERIAL)     mode_str = "Serial";
+        else if (s.mode == MODE_MPI_OPENCL) mode_str = "MPI+OpenCL";
+        else                                mode_str = "MPI+OpenMP";
+        printf("{\"status\": \"strategy\", \"mode\": \"%s\", "
+               "\"mpi_procs\": %d, \"omp_threads\": %d, "
+               "\"gpu\": %d, \"gpu_vram\": %llu, \"file_size\": %llu}\n",
+               mode_str, nprocs, s.num_threads,
+               gpu_available, (unsigned long long)gpu_mem,
+               (unsigned long long)total_size);
+        fflush(stdout);
+    }
+
     // ── Benchmark Mode ──────────────────────
     if (bench_mode) {
         if (rank == 0) printf("[BENCH] Starting benchmark comparison...\n");
@@ -218,6 +234,24 @@ int main(int argc, char *argv[]) {
     uint8_t *stream_buffer = (rank == 0) ? malloc(STREAM_CHUNK_SIZE) : NULL;
 
     if (rank == 0 && json_mode) printf("{\"status\": \"starting\", \"total\": %llu}\n", (unsigned long long)total_size);
+
+    /* record start time for elapsed */
+    double run_start = MPI_Wtime();
+
+    /* signal all ranks as active */
+    if (json_mode) {
+        /* flush stdout so GUI gets notified immediately */
+        if (rank == 0) fflush(stdout);
+        MPI_Barrier(MPI_COMM_WORLD);
+        /* each rank signals itself as active */
+        /* only rank 0 writes to stdout — send thread state for each rank */
+        if (rank == 0) {
+            for (int r = 0; r < nprocs; r++) {
+                printf("{\"status\": \"thread\", \"rank\": %d, \"state\": \"active\"}\n", r);
+            }
+            fflush(stdout);
+        }
+    }
 
     OpenCLContext ctx;
     if (s.mode == MODE_MPI_OPENCL) {
@@ -267,8 +301,15 @@ int main(int argc, char *argv[]) {
         if (rank == 0 && processed_chunk) {
             if (encrypting) EVP_MAC_update(mctx, processed_chunk, chunk_size);
             fwrite(processed_chunk, 1, chunk_size, f_out);
-            if (json_mode) printf("{\"status\": \"progress\", \"processed\": %llu}\n", (unsigned long long)(processed + chunk_size));
-            else printf("[INFO] Processed %llu/%llu bytes\n", (unsigned long long)(processed + chunk_size), (unsigned long long)total_size);
+            if (json_mode) {
+                printf("{\"status\": \"progress\", \"processed\": %llu}\n",
+                       (unsigned long long)(processed + chunk_size));
+                fflush(stdout);
+            } else {
+                printf("[INFO] Processed %llu/%llu bytes\n",
+                       (unsigned long long)(processed + chunk_size),
+                       (unsigned long long)total_size);
+            }
             free(processed_chunk);
         }
         processed += chunk_size;
@@ -276,6 +317,8 @@ int main(int argc, char *argv[]) {
 
     // ── Finalize ────────────────────────────
     if (rank == 0) {
+        double elapsed = MPI_Wtime() - run_start;
+
         if (encrypting) {
             // Auth header metadata too
             EVP_MAC_update(mctx, header.magic, MAGIC_SIZE);
@@ -286,8 +329,16 @@ int main(int argc, char *argv[]) {
             
             fseek(f_out, 0, SEEK_SET);
             fwrite(&header, 1, HEADER_SIZE, f_out);
-            if (json_mode) printf("{\"status\": \"complete\", \"output\": \"%s\"}\n", output_file);
-            else printf("[OK] Encryption complete. HMAC: ");
+            if (json_mode) {
+                printf("{\"status\": \"complete\", \"output\": \"%s\"}\n", output_file);
+                printf("{\"status\": \"timing\", \"mode\": \"cpu\", \"time\": %.4f}\n", elapsed);
+                /* signal all ranks done */
+                for (int r = 0; r < nprocs; r++)
+                    printf("{\"status\": \"thread\", \"rank\": %d, \"state\": \"done\"}\n", r);
+                fflush(stdout);
+            } else {
+                printf("[OK] Encryption complete. Elapsed: %.3fs\n", elapsed);
+            }
         } else {
             uint8_t computed_hmac[32];
             EVP_MAC_update(mctx, header.magic, MAGIC_SIZE);
@@ -302,15 +353,21 @@ int main(int argc, char *argv[]) {
                 fclose(f_out); f_out = NULL;
                 remove(output_file);
             } else {
-                if (json_mode) printf("{\"status\": \"complete\", \"output\": \"%s\"}\n", output_file);
-                else printf("[OK] Decryption complete. Integrity verified.\n");
+                if (json_mode) {
+                    printf("{\"status\": \"complete\", \"output\": \"%s\"}\n", output_file);
+                    printf("{\"status\": \"timing\", \"mode\": \"cpu\", \"time\": %.4f}\n", elapsed);
+                    for (int r = 0; r < nprocs; r++)
+                        printf("{\"status\": \"thread\", \"rank\": %d, \"state\": \"done\"}\n", r);
+                    fflush(stdout);
+                } else {
+                    printf("[OK] Decryption complete. Integrity verified. Elapsed: %.3fs\n", elapsed);
+                }
             }
         }
         
         if (f_in) { fclose(f_in); f_in = NULL; }
         if (f_out) { fclose(f_out); f_out = NULL; }
         free(stream_buffer);
-        // free(out_buffer); // mpi_gather_results might have allocated this, need to be careful
     }
 
     if (s.mode == MODE_MPI_OPENCL) opencl_cleanup(&ctx);
