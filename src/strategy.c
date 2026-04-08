@@ -70,19 +70,15 @@ Strategy decide_strategy(uint64_t file_size, int mpi_procs,
 
     } else if (file_size < LARGE_THRESHOLD) {
         // medium file — MPI + OpenMP scaled up
-        // double the chunks if file is large enough
-        int chunks    = mpi_procs * 2;
-        uint64_t cs   = file_size / chunks;
-
-        // make sure chunks aren't too small
-        if (cs < MIN_CHUNK_SIZE) {
-            chunks    = file_size / MIN_CHUNK_SIZE;
-            cs        = MIN_CHUNK_SIZE;
+        // use multiples of mpi_procs for even load balance
+        int chunks    = mpi_procs;
+        if (file_size > (uint64_t)mpi_procs * MIN_CHUNK_SIZE * 2) {
+             chunks = mpi_procs * 2;
         }
 
         s.mode        = MODE_MPI_OPENMP;
         s.num_chunks  = chunks;
-        s.chunk_size  = cs;
+        s.chunk_size  = file_size / chunks;
         s.num_threads = cpu_cores;
 
     } else {
@@ -91,7 +87,6 @@ Strategy decide_strategy(uint64_t file_size, int mpi_procs,
             s.mode = MODE_MPI_OPENCL;
 
             // use at most 25% of GPU memory per batch
-            // so we don't overflow GPU memory
             uint64_t safe_mem    = gpu_mem / 4;
             s.gpu_batch_size     = (int)(safe_mem / 16);
             s.num_chunks         = mpi_procs;
@@ -107,11 +102,17 @@ Strategy decide_strategy(uint64_t file_size, int mpi_procs,
         }
     }
 
-    // safety check — never more chunks than makes sense
-    if (s.num_chunks > (int)(file_size / MIN_CHUNK_SIZE)) {
-        s.num_chunks = (int)(file_size / MIN_CHUNK_SIZE);
-        if (s.num_chunks < 1) s.num_chunks = 1;
-        s.chunk_size = file_size / s.num_chunks;
+    // safety check — never allow fewer chunks than MPI processes
+    // unless the file is truly tiny (AES block size limits)
+    if (s.mode != MODE_SERIAL) {
+        if (s.num_chunks < mpi_procs) {
+            s.num_chunks = mpi_procs;
+        }
+        // ensure chunks are at least 16-byte aligned for AES
+        s.chunk_size = s.file_size / s.num_chunks;
+        if (s.chunk_size % 16 != 0) {
+            s.chunk_size += (16 - (s.chunk_size % 16));
+        }
     }
 
     return s;

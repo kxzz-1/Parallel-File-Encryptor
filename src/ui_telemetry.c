@@ -590,7 +590,7 @@ gboolean telemetry_draw_strategy(GtkWidget *w, cairo_t *cr, App *a) {
     /* stat pills row */
     typedef struct { const char *key; char val[24]; double r,g,b; } Pill;
     Pill pills[4];
-    pills[0].key = "Chunks";  snprintf(pills[0].val, 24, "%d",  s->mpi_procs);  pills[0].r=0.0; pills[0].g=0.831; pills[0].b=1.0;
+    pills[0].key = "Chunks";  snprintf(pills[0].val, 24, "%d",  s->num_chunks);  pills[0].r=0.0; pills[0].g=0.831; pills[0].b=1.0;
     pills[1].key = "Threads"; snprintf(pills[1].val, 24, "%d",  s->omp_threads);    pills[1].r=0.0; pills[1].g=0.831; pills[1].b=1.0;
     pills[2].key = "GPU";     snprintf(pills[2].val, 24, "%s",  s->gpu_detected?"YES":"NO"); pills[2].r=0.486; pills[2].g=0.227; pills[2].b=0.929;
     pills[3].key = "VRAM";

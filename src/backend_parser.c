@@ -298,13 +298,16 @@ static void parse_json(const char *json, App *a) {
     if (strcmp(status, "strategy") == 0) {
         char mode_name[64] = {0};
         json_str(json, "mode", mode_name, sizeof(mode_name));
-        int mpi = 0, omp = 0, gpu = 0;
+        int mpi = 0, omp = 0, gpu = 0, chunks = 0;
         unsigned long long vram = 0, fsize = 0;
         json_int(json, "mpi_procs",   &mpi);
         json_int(json, "omp_threads", &omp);
+        json_int(json, "num_chunks",  &chunks);
         json_int(json, "gpu",         &gpu);
         json_ull(json, "gpu_vram",    &vram);
         json_ull(json, "file_size",   &fsize);
+
+        if (chunks > 0) a->strategy.num_chunks = chunks;
         if (mpi > 0) {
             a->strategy.mpi_procs = mpi;
             int capped = mpi > MAX_MPI_PROCS ? MAX_MPI_PROCS : mpi;
@@ -341,6 +344,7 @@ static void parse_json(const char *json, App *a) {
         }
 
         /* Determine strategy mode enum and reason */
+        a->strategy.mode = MODE_MPI_OPENMP;
         if (strstr(mode_name, "Serial") || strstr(mode_name, "serial")) {
             a->strategy.mode = MODE_SERIAL;
             g_strlcpy(a->strategy.reason,
@@ -348,27 +352,52 @@ static void parse_json(const char *json, App *a) {
         } else if (strstr(mode_name, "OpenCL") || strstr(mode_name, "GPU") || strstr(mode_name, "gpu")) {
             a->strategy.mode = MODE_MPI_OPENCL;
             g_strlcpy(a->strategy.reason,
-                "Large file + GPU detected.\nUsing MPI + OpenCL\nfor maximum throughput.", 255);
+                "Large dataset found.\nOffloading AES-CTR to GPU via OpenCL.\nMPI workload distribution enabled.", 255);
         } else {
-            a->strategy.mode = MODE_MPI_OPENMP;
             g_strlcpy(a->strategy.reason,
-                "File 1 MB – 1 GB.\nUsing MPI + OpenMP\nfor CPU parallelism.", 255);
+                "Medium dataset detected.\nUsing MPI distribution + OpenMP.\nFull CPU acceleration active.", 255);
         }
-
-        /* Update left-panel strategy label */
-        if (a->strategy_label)
-            gtk_label_set_text(GTK_LABEL(a->strategy_label), mode_name);
-
-        /* Redraw all affected panels */
-        if (a->strategy_card) gtk_widget_queue_draw(a->strategy_card);
-        if (a->heatmap_area)  gtk_widget_queue_draw(a->heatmap_area);
+        g_strlcpy(a->strategy.mode_name, mode_name, sizeof(a->strategy.mode_name));
+        
+        a->has_strategy = 1;
+        if (a->strategy_label) gtk_label_set_text(GTK_LABEL(a->strategy_label), mode_name);
+        if (a->strategy_card)  gtk_widget_queue_draw(a->strategy_card);
+        if (a->heatmap_area)   gtk_widget_queue_draw(a->heatmap_area);
+        if (a->split_area)     gtk_widget_queue_draw(a->split_area);
 
         char logmsg[256];
         snprintf(logmsg, sizeof(logmsg),
-            "Strategy: %s | MPI=%d OMP=%d GPU=%s VRAM=%.0f MB",
-            mode_name, mpi, omp, gpu ? "YES" : "NO",
-            (double)vram / 1048576.0);
+            "Strategy: %s | MPI=%d OMP=%d Chunks=%d",
+            mode_name, mpi, omp, chunks);
         log_append(a, logmsg, LOG_OK);
+        return;
+    }
+
+    /* ── {"status":"rank_state","rank":N,"state":"..."} ── */
+    if (strcmp(status, "rank_state") == 0) {
+        int r = -1;
+        char state[32] = {0};
+        json_int(json, "rank", &r);
+        json_str(json, "state", state, sizeof(state));
+        if (r >= 0 && r < MAX_MPI_PROCS) {
+            if      (strcmp(state, "received") == 0) a->procs[r].state = PROC_RECEIVED;
+            else if (strcmp(state, "working")  == 0) a->procs[r].state = PROC_PROCESSING;
+            else if (strcmp(state, "done")     == 0) a->procs[r].state = PROC_DONE;
+            if (a->split_area) gtk_widget_queue_draw(a->split_area);
+        }
+        return;
+    }
+
+    /* ── {"status":"rank_progress","rank":N,"progress":F} ── */
+    if (strcmp(status, "rank_progress") == 0) {
+        int r = -1;
+        double f = 0.0;
+        json_int(json, "rank", &r);
+        json_dbl(json, "progress", &f);
+        if (r >= 0 && r < MAX_MPI_PROCS) {
+            a->procs[r].progress = CLAMP_D(f, 0.0, 1.0);
+            if (a->split_area) gtk_widget_queue_draw(a->split_area);
+        }
         return;
     }
 
@@ -526,6 +555,7 @@ static void parse_legacy(const char *line, App *a) {
 
     /* ── chunks / processes ── */
     if (strcasestr(line, "chunk") || strcasestr(line, "processes")) {
+        if (a->has_strategy) return; // JSON strategy takes precedence
         const char *after_colon = strchr(line, ':');
         if (first_int(after_colon ? after_colon+1 : line, &n) &&
             n > 0 && n <= 64) {
@@ -545,6 +575,7 @@ static void parse_legacy(const char *line, App *a) {
         (strcasestr(line,"per")||strcasestr(line,"/proc")||
          strcasestr(line,"count")||strcasestr(line,"num")||
          strcasestr(line,"using")||strcasestr(line,"spawn"))) {
+        if (a->has_strategy && a->strategy.omp_threads > 0) return; // Keep global strategy
         const char *colon = strchr(line, ':');
         if (first_int(colon ? colon+1 : line, &n) && n > 0 && n <= 64) {
             a->num_threads = n > MAX_THREADS ? MAX_THREADS : n;
@@ -735,6 +766,8 @@ void backend_parse_line(const char *line, App *a) {
 
 /* ── Convenience: reset parser state between runs ─────────────────────────── */
 void backend_parser_reset(App *a) {
+    if (!a) return;
+    a->has_strategy = 0;
     a->json_buf_len = 0;
     a->json_buf[0]  = '\0';
     a->has_error    = 0;

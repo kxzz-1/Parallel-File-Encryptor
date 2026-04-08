@@ -91,6 +91,7 @@ typedef struct {
     int          omp_threads;
     uint64_t     file_size;
     uint64_t     chunk_size;
+    int          num_chunks;
 } StrategyInfo;
 
 /* ── Memory telemetry ───────────────────────────────────────────────────── */
@@ -163,6 +164,7 @@ typedef struct {
     int         encrypting;         /* 1=encrypt, 0=decrypt                  */
     int         is_running;
     int         is_bench;
+    int         has_strategy;
     int         has_error;
     int         is_fullscreen;
     char        error_msg[512];

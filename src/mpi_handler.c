@@ -22,15 +22,15 @@ void mpi_scatter_file(FileBuffer *file, Chunk *chunk,
         uint64_t remaining = file->size;
         uint64_t pos       = 0;
 
-        /* base chunk size per proc for this buffer, aligned to AES block size (16) */
-        uint64_t base_cs = file->size / nprocs;
-        base_cs -= (base_cs % 16);
+        /* base chunk size for this specific pulse, aligned to AES block size (16) */
+        uint64_t pulse_cs = file->size / nprocs;
+        pulse_cs -= (pulse_cs % 16);
 
         for (int i = 0; i < nprocs; i++) {
             // last process gets any leftover bytes
             uint64_t cs = (i == nprocs - 1)
                           ? remaining
-                          : base_cs;
+                          : pulse_cs;
 
             sendcounts[i] = (int)cs;
             displs[i]     = (int)pos;

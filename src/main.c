@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -6,6 +7,7 @@
 #include <mpi.h>
 #include <omp.h>
 #include <libgen.h>
+#include <sched.h>
 #include "file_io.h"
 #include "strategy.h"
 #include "serial_aes.h"
@@ -176,6 +178,21 @@ int main(int argc, char *argv[]) {
     uint64_t gpu_mem = 0;
     int gpu_available = detect_gpu(&gpu_mem);
     int cpu_cores = omp_get_max_threads();
+    if (rank == 0) {
+        printf("[DEBUG] OMP_NUM_THREADS = %s\n", getenv("OMP_NUM_THREADS") ? getenv("OMP_NUM_THREADS") : "not set");
+        printf("[DEBUG] Detected cpu_cores = %d\n", cpu_cores);
+        
+        #ifdef __linux__
+        cpu_set_t mask;
+        if (sched_getaffinity(0, sizeof(cpu_set_t), &mask) == 0) {
+            int affinity_count = CPU_COUNT(&mask);
+            if (affinity_count < cpu_cores) {
+                printf("[WARN] Process affinity restricted to %d cores (limit set by MPI runner)\n", affinity_count);
+                printf("[TIP]  Use 'mpirun --bind-to none' to utilize all %d cores.\n", cpu_cores);
+            }
+        }
+        #endif
+    }
     Strategy s = decide_strategy(total_size, nprocs, cpu_cores, gpu_available, gpu_mem);
     
     if (force_mode == 0) s.mode = MODE_SERIAL;
@@ -190,12 +207,17 @@ int main(int argc, char *argv[]) {
         else if (s.mode == MODE_MPI_OPENCL) mode_str = "MPI+OpenCL";
         else                                mode_str = "MPI+OpenMP";
         printf("{\"status\": \"strategy\", \"mode\": \"%s\", "
-               "\"mpi_procs\": %d, \"omp_threads\": %d, "
+               "\"mpi_procs\": %d, \"omp_threads\": %d, \"num_chunks\": %d, "
                "\"gpu\": %d, \"gpu_vram\": %llu, \"file_size\": %llu}\n",
-               mode_str, nprocs, s.num_threads,
+               mode_str, nprocs, s.num_threads, s.num_chunks,
                gpu_available, (unsigned long long)gpu_mem,
                (unsigned long long)total_size);
         fflush(stdout);
+    }
+
+    if (rank == 0) {
+        printf("Starting %s...\n", (s.mode == MODE_SERIAL) ? "Serial" : 
+                                   (s.mode == MODE_MPI_OPENCL) ? "MPI+OpenCL" : "MPI+OpenMP");
     }
 
     // ── Benchmark Mode ──────────────────────
@@ -270,6 +292,12 @@ int main(int argc, char *argv[]) {
             }
             fb.data = stream_buffer;
             if (!encrypting) EVP_MAC_update(mctx, stream_buffer, chunk_size);
+            
+            if (json_mode) {
+                for (int r = 0; r < nprocs; r++)
+                    printf("{\"status\": \"rank_state\", \"rank\": %d, \"state\": \"working\"}\n", r);
+                fflush(stdout);
+            }
         }
 
         // Parallel processing of this pulse
@@ -287,8 +315,12 @@ int main(int argc, char *argv[]) {
             uint8_t *chunk_out = malloc(chunk.size);
             if (s.mode == MODE_MPI_OPENCL && ctx.ready)
                 opencl_encrypt_chunk(&ctx, &chunk, chunk_out, key, nonce, &s);
-            else
+            else {
+                /* each rank prints its own work line (legacy support) but JSON takes precedence */
+                printf("[INFO] Process %d — OpenMP using %d threads for %llu bytes\n", 
+                       rank, s.num_threads, (unsigned long long)chunk.size);
                 omp_encrypt_chunk(&chunk, chunk_out, key, nonce, &s);
+            }
             
             memcpy(chunk.data, chunk_out, chunk.size);
             free(chunk_out);
@@ -301,18 +333,26 @@ int main(int argc, char *argv[]) {
         if (rank == 0 && processed_chunk) {
             if (encrypting) EVP_MAC_update(mctx, processed_chunk, chunk_size);
             fwrite(processed_chunk, 1, chunk_size, f_out);
+            
+            processed += chunk_size;
+
             if (json_mode) {
-                printf("{\"status\": \"progress\", \"processed\": %llu}\n",
-                       (unsigned long long)(processed + chunk_size));
+                double frac = (double)processed / (double)total_size;
+                printf("{\"status\": \"progress\", \"processed\": %llu}\n", (unsigned long long)processed);
+                for (int r = 0; r < nprocs; r++) {
+                    printf("{\"status\": \"rank_progress\", \"rank\": %d, \"progress\": %f}\n", r, frac);
+                    printf("{\"status\": \"rank_state\", \"rank\": %d, \"state\": \"received\"}\n", r);
+                }
                 fflush(stdout);
             } else {
                 printf("[INFO] Processed %llu/%llu bytes\n",
-                       (unsigned long long)(processed + chunk_size),
+                       (unsigned long long)processed,
                        (unsigned long long)total_size);
             }
             free(processed_chunk);
+        } else if (rank == 0) {
+            processed += chunk_size;
         }
-        processed += chunk_size;
     }
 
     // ── Finalize ────────────────────────────
